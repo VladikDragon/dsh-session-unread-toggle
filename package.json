@@ -1,0 +1,51 @@
+{
+  "name": "dsh-session-unread-toggle",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Adds a Session context-menu action that marks a finished Session as unread again (restoring the sidebar's green completion dot) or clears that mark.",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "sidebar",
+    "sessions",
+    "unread",
+    "web-ui"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/VladikDragon/dsh-session-unread-toggle.git"
+  },
+  "homepage": "https://github.com/VladikDragon/dsh-session-unread-toggle#readme",
+  "bugs": {
+    "url": "https://github.com/VladikDragon/dsh-session-unread-toggle/issues"
+  },
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-session",
+        "@deepseek-ai/dsh-client-ui-workspace",
+        "@deepseek-ai/dsh-client-ui-context-menu"
+      ]
+    }
+  }
+}

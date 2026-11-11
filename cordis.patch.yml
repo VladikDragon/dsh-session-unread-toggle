@@ -1,0 +1,5 @@
+# The unread-toggle bundle patch: one Loader row whose browser half registers
+# a Session context-menu action and the green-dot icon it shows.
+- insert:
+    - id: session-unread-toggle
+      name: dsh-session-unread-toggle
