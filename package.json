@@ -1,12 +1,15 @@
 {
   "name": "dsh-session-unread-toggle",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "description": "Adds a Session context-menu action that marks a finished Session as unread again (restoring the sidebar's green completion dot) or clears that mark.",
   "main": "index.js",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js"
+  },
+  "scripts": {
+    "test": "node test/client.test.cjs client.js"
   },
   "files": [
     "index.js",

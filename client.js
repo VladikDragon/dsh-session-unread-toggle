@@ -62,16 +62,29 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
+		 * Whether two mark maps say the same thing.
+		 * @param left - first map.
+		 * @param right - second map.
+		 * @returns whether both hold the same ids with the same armed flags.
+		 */
+		function sameMarks(left, right) {
+			if (left.size !== right.size) return false;
+			for (const [id, armed] of left) {
+				if (right.get(id) !== armed) return false;
+			}
+			return true;
+		}
+
+		/**
 		 * Mark set plus the observable face the context menu re-resolves from.
 		 * @returns the store used by this plugin.
 		 */
 		function createMarkStore() {
-			const marks = readMarks();
+			let marks = readMarks();
 			let snapshot = new Set(marks.keys());
 			const listeners = new Set();
-			const publish = () => {
+			const notify = () => {
 				snapshot = new Set(marks.keys());
-				writeMarks(marks);
 				for (const listener of [...listeners]) {
 					try {
 						listener();
@@ -79,6 +92,10 @@ window.__ModuleLoader__.load({
 						// One broken subscriber must not stop the others.
 					}
 				}
+			};
+			const publish = () => {
+				notify();
+				writeMarks(marks);
 			};
 			return {
 				source: {
@@ -100,6 +117,18 @@ window.__ModuleLoader__.load({
 				clear(sessionId) {
 					if (!marks.delete(sessionId)) return;
 					publish();
+				},
+				/**
+				 * Adopt the marks another tab or window wrote. The reload is not
+				 * written back, so two tabs cannot echo the same value at each other.
+				 * @returns whether anything changed.
+				 */
+				reload() {
+					const next = readMarks();
+					if (sameMarks(marks, next)) return false;
+					marks = next;
+					notify();
+					return true;
 				},
 			};
 		}
@@ -141,48 +170,74 @@ window.__ModuleLoader__.load({
 				const hasPrompt = (row) => row?.projectionValues?.sessionListMetadata?.lastPromptAt != null;
 
 				/**
+				 * Reminders this plugin put into `completionUnread`. They are withdrawn
+				 * when their mark goes away, including a mark cleared in another tab,
+				 * while a dot the Session service raised on its own is left alone.
+				 */
+				const owned = new Set();
+
+				/**
 				 * Mirror the marks onto the Session service's own completion reminders.
 				 * A mark keeps its dot until the reader opens that Session again; the
 				 * Session they are looking at right now stays read, and its dot appears
-				 * once they leave it.
+				 * once they leave it. An archived Session keeps its mark but draws no
+				 * dot, so the mark is waiting when the Session is restored.
 				 */
+				let syncing = false;
 				const sync = () => {
+					// Publishing the status re-enters this function through its own
+					// subscription; the pass in flight has already read every mark.
+					if (syncing) return;
 					const uiSession = sessionService();
 					const unread = uiSession?.completionUnread;
 					if (!(unread instanceof Set)) return;
-					const list = listOf();
-					let changed = false;
-					for (const [sessionId, armed] of marks.entries()) {
-						const row = list.byId[sessionId];
-						if (row === undefined) {
-							if (list.phase === 'ready') marks.clear(sessionId);
-							continue;
+					syncing = true;
+					try {
+						const list = listOf();
+						let changed = false;
+						for (const [sessionId, armed] of marks.entries()) {
+							const row = list.byId[sessionId];
+							if (row === undefined) {
+								if (list.phase === 'ready') marks.clear(sessionId);
+								continue;
+							}
+							if (isArchived(sessionId)) {
+								// An archived row draws no status dot: hold the mark, drop only the reminder.
+								owned.delete(sessionId);
+								if (unread.delete(sessionId)) changed = true;
+								continue;
+							}
+							const main = isMain(row);
+							if (main && armed) {
+								// The reader came back: the reminder is served.
+								marks.clear(sessionId);
+								owned.delete(sessionId);
+								if (unread.delete(sessionId)) changed = true;
+								continue;
+							}
+							if (!main && !armed) marks.mark(sessionId, true);
+							if (main) {
+								owned.delete(sessionId);
+								if (unread.delete(sessionId)) changed = true;
+								continue;
+							}
+							if (row.running === true) continue;
+							if (!unread.has(sessionId)) {
+								unread.add(sessionId);
+								changed = true;
+							}
+							owned.add(sessionId);
 						}
-						if (isArchived(sessionId)) {
-							// An archived row draws no status dot; drop the mark with it.
-							marks.clear(sessionId);
+						// A mark that is gone, wherever it was cleared, takes its dot with it.
+						for (const sessionId of [...owned]) {
+							if (marks.has(sessionId)) continue;
+							owned.delete(sessionId);
 							if (unread.delete(sessionId)) changed = true;
-							continue;
 						}
-						const main = isMain(row);
-						if (main && armed) {
-							// The reader came back: the reminder is served.
-							marks.clear(sessionId);
-							if (unread.delete(sessionId)) changed = true;
-							continue;
-						}
-						if (!main && !armed) marks.mark(sessionId, true);
-						if (main) {
-							if (unread.delete(sessionId)) changed = true;
-							continue;
-						}
-						if (row.running === true) continue;
-						if (!unread.has(sessionId)) {
-							unread.add(sessionId);
-							changed = true;
-						}
+						if (changed && typeof uiSession.publishStatus === 'function') uiSession.publishStatus();
+					} finally {
+						syncing = false;
 					}
-					if (changed && typeof uiSession.publishStatus === 'function') uiSession.publishStatus();
 				};
 
 				/** Turn the reminder on or off for one Session. */
@@ -194,6 +249,7 @@ window.__ModuleLoader__.load({
 						marks.mark(sessionId, !isMain(row));
 					} else {
 						marks.clear(sessionId);
+						owned.delete(sessionId);
 						if (unread instanceof Set && unread.delete(sessionId) && typeof uiSession.publishStatus === 'function') {
 							uiSession.publishStatus();
 						}
@@ -205,13 +261,47 @@ window.__ModuleLoader__.load({
 
 				ctx.effect(
 					() => {
-						const dispose = sessions.list.subscribe(() => {
-							sync();
-						});
+						let statusDispose;
+						/**
+						 * Follow the status store as well, so a dot returns after a reload
+						 * and after a running Session finishes, not only when the list
+						 * itself changes. The service is looked up again on every list
+						 * change in case it was not reachable yet.
+						 */
+						const bindStatus = () => {
+							if (statusDispose !== undefined) return;
+							const status = sessionService()?.sessionStatus;
+							if (status?.subscribe === undefined) return;
+							statusDispose = status.subscribe(sync);
+						};
+						const disposers = [
+							sessions.list.subscribe(() => {
+								bindStatus();
+								sync();
+							}),
+							workspaces.list.subscribe(sync),
+						];
+						bindStatus();
 						sync();
-						return dispose;
+						return () => {
+							for (const dispose of disposers) dispose();
+							if (statusDispose !== undefined) statusDispose();
+						};
 					},
 					'session-unread: reminder sync',
+				);
+
+				ctx.effect(
+					() => {
+						/** Another tab marked a Session, so this one adopts the marks and redraws. */
+						const onStorage = (event) => {
+							if (event.key !== null && event.key !== STORAGE_KEY) return;
+							if (marks.reload()) sync();
+						};
+						window.addEventListener('storage', onStorage);
+						return () => window.removeEventListener('storage', onStorage);
+					},
+					'session-unread: cross-window marks',
 				);
 
 				const menuDefinition = {
