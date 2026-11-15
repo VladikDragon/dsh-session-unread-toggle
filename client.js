@@ -9,20 +9,64 @@ window.__ModuleLoader__.load({
 		/** Browser-local marks survive a reload, unlike the process-local reminder set. */
 		const STORAGE_KEY = 'dsh.sessionUnreadMarks.v1';
 
+		/** The folder-row seat this plugin prefers when the Workspace browser declares it. */
+		const FOLDER_SLOT = 'sidebar.workspace.row.trailing';
+
+		/** The row attribute the sidebar's folder row carries in every DSH build. */
+		const ROW_ATTRIBUTE = 'data-row-key';
+		const ROW_PREFIX = 'workspace:';
+		const ROW_SELECTOR = '[' + ROW_ATTRIBUTE + '^="' + ROW_PREFIX + '"]';
+
+		/** Marks this plugin drew itself, so a repaint finds them and a slot can replace them. */
+		const BADGE_ATTRIBUTE = 'data-unread-folder-badge';
+		const BADGE_SELECTOR = '[' + BADGE_ATTRIBUTE + ']';
+		const STYLE_ATTRIBUTE = 'data-unread-folder-style';
+
 		const DICTIONARIES = {
 			en: {
 				'mark.unread': 'Mark as unread',
 				'mark.read': 'Mark as read',
+				'folders.unread': 'Unread sessions: {n}',
 			},
 			ru: {
 				'mark.unread': 'Отметить как непрочитанное',
 				'mark.read': 'Отметить как прочитанное',
+				'folders.unread': 'Непрочитанных сессий: {n}',
 			},
 			zh: {
 				'mark.unread': '标记为未读',
 				'mark.read': '标记为已读',
+				'folders.unread': '未读会话：{n}',
 			},
 		};
+
+		/** Folder marks borrow the row's geometry: a completion-sized dot and a count. */
+		const STYLE = [
+			BADGE_SELECTOR + ' {',
+			'  display: inline-flex;',
+			'  align-items: center;',
+			'  gap: 4px;',
+			'  flex: none;',
+			'  margin-left: 4px;',
+			'  margin-right: 2px;',
+			'  pointer-events: none;',
+			'}',
+			BADGE_SELECTOR + ' > i {',
+			'  display: block;',
+			'  width: 8px;',
+			'  height: 8px;',
+			'  border-radius: 50%;',
+			'  flex: none;',
+			'  background: var(--dsw-alias-state-success-primary, currentColor);',
+			'}',
+			BADGE_SELECTOR + ' > b {',
+			'  font-size: 11px;',
+			'  line-height: 16px;',
+			'  font-weight: 500;',
+			'  font-variant-numeric: tabular-nums;',
+			'  color: var(--dsw-alias-label-secondary, currentColor);',
+			'}',
+		].join('\n');
 
 		/**
 		 * Read the persisted marks.
@@ -257,6 +301,117 @@ window.__ModuleLoader__.load({
 					sync();
 				};
 
+				/**
+				 * Unread Sessions per folder, counted from the very reminder set the
+				 * sidebar draws dots from, so a folder never promises a dot that is
+				 * absent inside it.
+				 * @returns map of workspace id ('' for ungrouped) to unread count.
+				 */
+				const countUnread = () => {
+					const counts = new Map();
+					const unread = sessionService()?.completionUnread;
+					if (!(unread instanceof Set) || unread.size === 0) return counts;
+					const list = listOf();
+					const snapshot = workspaces.list.getSnapshot();
+					const archived = new Set(snapshot.archivedSessionIds ?? []);
+					const rows = list.byId ?? {};
+
+					/** Archived, running, blank and subagent Sessions draw no completion dot. */
+					const countable = (sessionId) => {
+						if (archived.has(sessionId)) return false;
+						const row = rows[sessionId];
+						if (row === undefined) return false;
+						if (row.running === true) return false;
+						if (row.blank === true) return false;
+						if (row.origin === 'subagent') return false;
+						return true;
+					};
+
+					const accounted = new Set();
+					for (const workspace of snapshot.items ?? []) {
+						let count = 0;
+						for (const sessionId of workspace.sessionIds ?? []) {
+							accounted.add(sessionId);
+							if (unread.has(sessionId) && countable(sessionId)) count += 1;
+						}
+						if (count > 0) counts.set(workspace.workspaceId, count);
+					}
+
+					let stray = 0;
+					for (const sessionId of list.ids ?? []) {
+						if (accounted.has(sessionId)) continue;
+						if (unread.has(sessionId) && countable(sessionId)) stray += 1;
+					}
+					if (stray > 0) counts.set('', stray);
+					return counts;
+				};
+
+				/**
+				 * Folder seat for the patched Workspace browser. It re-reads the counts
+				 * whenever a Session, a folder or a status changes.
+				 * @param props.workspaceId - the folder this row shows, undefined for the ungrouped row.
+				 * @param props.t - this namespace's locale seat.
+				 * @returns the mark, or nothing while the folder is clear.
+				 */
+				function FolderMark({ workspaceId, t: translate }) {
+					const [, bump] = React.useState(0);
+					React.useEffect(() => {
+						const bumpOnce = () => bump((value) => value + 1);
+						const disposers = [sessions.list.subscribe(bumpOnce), workspaces.list.subscribe(bumpOnce)];
+						const status = sessionService()?.sessionStatus;
+						if (status?.subscribe !== undefined) disposers.push(status.subscribe(bumpOnce));
+						return () => {
+							for (const dispose of disposers) dispose();
+						};
+					}, []);
+					const count = countUnread().get(workspaceId ?? '') ?? 0;
+					if (count === 0) return null;
+					const label = translate('folders.unread', { n: count });
+					return React.createElement(
+						'span',
+						{
+							style: {
+								display: 'inline-flex',
+								alignItems: 'center',
+								gap: 4,
+								flex: 'none',
+								marginLeft: 4,
+								marginRight: 2,
+								pointerEvents: 'none',
+							},
+							role: 'img',
+							'aria-label': label,
+							title: label,
+						},
+						React.createElement('i', {
+							style: {
+								display: 'block',
+								width: 8,
+								height: 8,
+								borderRadius: '50%',
+								flex: 'none',
+								background: 'var(--dsw-alias-state-success-primary, currentColor)',
+							},
+						}),
+						React.createElement(
+							'b',
+							{
+								style: {
+									fontSize: 11,
+									lineHeight: '16px',
+									fontWeight: 500,
+									fontVariantNumeric: 'tabular-nums',
+									color: 'var(--dsw-alias-label-secondary, currentColor)',
+								},
+							},
+							String(count),
+						),
+					);
+				}
+
+				/** Whether the patched Workspace browser took the slot seat. */
+				let slotActive = false;
+
 				ctx.effect(() => ctx.locale.register(NS, DICTIONARIES), 'session-unread: dictionaries');
 
 				ctx.effect(
@@ -342,6 +497,111 @@ window.__ModuleLoader__.load({
 						ReadIcon,
 					);
 				});
+
+				// ------------------------------------------------------------ folder marks
+
+				/** Remove every mark the fallback drew, so a slot takeover leaves no duplicate. */
+				const clearDrawn = () => {
+					if (document.body === null) return;
+					for (const badge of document.querySelectorAll(BADGE_SELECTOR)) badge.remove();
+				};
+
+				/**
+				 * Draw one folder's mark, creating it on first need. The mark sits before
+				 * the row's hover actions so it keeps its place when those appear.
+				 * @param row - the folder row element.
+				 * @param count - unread Sessions in that folder.
+				 */
+				const paintRow = (row, count) => {
+					const existing = row.querySelector(BADGE_SELECTOR);
+					if (count === 0) {
+						if (existing !== null) existing.remove();
+						return;
+					}
+					let badge = existing;
+					if (badge === null) {
+						badge = document.createElement('span');
+						badge.setAttribute(BADGE_ATTRIBUTE, '');
+						badge.setAttribute('role', 'img');
+						badge.appendChild(document.createElement('i'));
+						badge.appendChild(document.createElement('b'));
+						const actions = row.querySelector('[class*="rowActions"]');
+						if (actions !== null && actions.parentNode === row) row.insertBefore(badge, actions);
+						else row.appendChild(badge);
+					}
+					const number = badge.lastElementChild;
+					const text = String(count);
+					if (number !== null && number.textContent !== text) number.textContent = text;
+					const description = t('folders.unread', { n: count });
+					if (badge.getAttribute('aria-label') !== description) {
+						badge.setAttribute('aria-label', description);
+						badge.setAttribute('title', description);
+					}
+				};
+
+				/** Reconcile every folder row on screen with the current counts. */
+				const paint = () => {
+					if (slotActive || document.body === null) return;
+					const counts = countUnread();
+					for (const row of document.querySelectorAll(ROW_SELECTOR)) {
+						const raw = row.getAttribute(ROW_ATTRIBUTE) ?? '';
+						paintRow(row, counts.get(raw.slice(ROW_PREFIX.length)) ?? 0);
+					}
+				};
+
+				let scheduled = false;
+				/** Coalesce repaints into one frame: the sidebar re-renders on every update. */
+				const schedule = () => {
+					if (scheduled || slotActive) return;
+					scheduled = true;
+					requestAnimationFrame(() => {
+						scheduled = false;
+						paint();
+					});
+				};
+
+				/**
+				 * Prefer the declared seat: a patched Workspace browser renders the mark
+				 * itself, so the DOM fallback must stand down or it would draw twice.
+				 */
+				ctx.effect(
+					() =>
+						ctx.slots.inject(FOLDER_SLOT, () => {
+							slotActive = true;
+							clearDrawn();
+							return ctx.slots.register(
+								{ name: FOLDER_SLOT, id: 'unread-folder-mark', order: 10, locale: NS },
+								FolderMark,
+							);
+						}),
+					'session-unread: folder slot',
+				);
+
+				/**
+				 * Fallback for a stock DSH whose folder rows have no seat: decorate the
+				 * row in place. It stays inert whenever the slot above took over.
+				 */
+				ctx.effect(
+					() => {
+						const style = document.createElement('style');
+						style.setAttribute(STYLE_ATTRIBUTE, '');
+						style.textContent = STYLE;
+						document.head.appendChild(style);
+						const observer = new MutationObserver(schedule);
+						observer.observe(document.body, { childList: true, subtree: true });
+						const disposers = [sessions.list.subscribe(schedule), workspaces.list.subscribe(schedule)];
+						const status = sessionService()?.sessionStatus;
+						if (status?.subscribe !== undefined) disposers.push(status.subscribe(schedule));
+						schedule();
+						return () => {
+							observer.disconnect();
+							for (const dispose of disposers) dispose();
+							style.remove();
+							clearDrawn();
+						};
+					},
+					'session-unread: folder fallback',
+				);
 			},
 		};
 	},

@@ -1,12 +1,152 @@
 /**
- * Headless harness for dsh-session-unread-toggle 1.1.0: mocks the Client
- * services the browser half reads, then drives the scenarios the release adds.
+ * Headless harness for dsh-session-unread-toggle: mocks the Client services and the
+ * little DOM the browser half touches, then drives the release's scenarios.
+ *
+ * Run: node test/client.test.cjs client.js
  */
 const fs = require('node:fs');
 const assert = require('node:assert');
 
-const CLIENT = process.argv[2];
+const CLIENT = process.argv[2] ?? 'client.js';
 const STORAGE_KEY = 'dsh.sessionUnreadMarks.v1';
+const FOLDER_SLOT = 'sidebar.workspace.row.trailing';
+
+// ------------------------------------------------------------------ fake DOM
+
+class FakeElement {
+	constructor(tag) {
+		this.tagName = tag.toUpperCase();
+		this.attributes = new Map();
+		this.childNodes = [];
+		this.parentNode = null;
+		this.textContent = '';
+		this._classes = '';
+	}
+	getAttribute(name) {
+		return this.attributes.has(name) ? this.attributes.get(name) : null;
+	}
+	setAttribute(name, value) {
+		this.attributes.set(name, String(value));
+	}
+	removeAttribute(name) {
+		this.attributes.delete(name);
+	}
+	get class() {
+		return this._classes;
+	}
+	set class(value) {
+		this._classes = String(value);
+	}
+	get lastElementChild() {
+		return this.childNodes.length === 0 ? null : this.childNodes[this.childNodes.length - 1];
+	}
+	appendChild(child) {
+		child.parentNode = this;
+		this.childNodes.push(child);
+		return child;
+	}
+	insertBefore(child, anchor) {
+		const index = this.childNodes.indexOf(anchor);
+		child.parentNode = this;
+		if (index < 0) this.childNodes.push(child);
+		else this.childNodes.splice(index, 0, child);
+		return child;
+	}
+	remove() {
+		if (this.parentNode === null) return;
+		const index = this.parentNode.childNodes.indexOf(this);
+		if (index >= 0) this.parentNode.childNodes.splice(index, 1);
+		this.parentNode = null;
+	}
+	querySelectorAll(selector) {
+		const out = [];
+		const walk = (node) => {
+			for (const child of node.childNodes) {
+				if (matchSelector(child, selector)) out.push(child);
+				walk(child);
+			}
+		};
+		walk(this);
+		return out;
+	}
+	querySelector(selector) {
+		return this.querySelectorAll(selector)[0] ?? null;
+	}
+}
+
+/** Supports only the selector shapes this plugin uses. */
+function matchSelector(element, selector) {
+	if (selector.startsWith('[data-row-key^="')) {
+		const prefix = selector.slice('[data-row-key^="'.length, -2);
+		const value = element.getAttribute('data-row-key');
+		return value !== null && value.startsWith(prefix);
+	}
+	if (selector.startsWith('[class*="')) {
+		const needle = selector.slice('[class*="'.length, -2);
+		return element.class.includes(needle);
+	}
+	if (selector.startsWith('[') && selector.endsWith(']')) {
+		return element.getAttribute(selector.slice(1, -1)) !== null;
+	}
+	throw new Error('unsupported selector: ' + selector);
+}
+
+/** One folder row shaped like the sidebar's: title, then the hover actions. */
+function makeFolderRow(key) {
+	const row = new FakeElement('div');
+	row.setAttribute('data-row-key', 'workspace:' + key);
+	row.setAttribute('aria-expanded', 'false');
+	const title = new FakeElement('span');
+	title.class = 'wnFoaW_title';
+	title.textContent = key === '' ? 'Ungrouped' : key;
+	row.appendChild(title);
+	const actions = new FakeElement('span');
+	actions.class = 'wnFoaW_rowActions';
+	row.appendChild(actions);
+	return row;
+}
+
+function installDom() {
+	const head = new FakeElement('head');
+	const body = new FakeElement('body');
+	const document = {
+		head,
+		body,
+		createElement: (tag) => new FakeElement(tag),
+		querySelectorAll: (selector) => body.querySelectorAll(selector),
+		querySelector: (selector) => body.querySelector(selector),
+	};
+	let frames = [];
+	global.document = document;
+	global.requestAnimationFrame = (callback) => {
+		frames.push(callback);
+		return frames.length;
+	};
+	global.MutationObserver = class {
+		constructor(callback) {
+			this.callback = callback;
+		}
+		observe() {}
+		disconnect() {}
+	};
+	return {
+		document,
+		head,
+		body,
+		flush() {
+			const queued = frames;
+			frames = [];
+			for (const callback of queued) callback();
+		},
+		reset() {
+			body.childNodes = [];
+			head.childNodes = [];
+			frames = [];
+		},
+	};
+}
+
+const dom = installDom();
 
 /** Minimal localStorage with a shared backing store, so "another tab" is the same map. */
 function createStorage() {
@@ -59,12 +199,25 @@ function listOfSessions(rows, phase = 'ready') {
 	return { phase, ids, byId };
 }
 
-function boot({ marks = [], rows = [], archived = [], phase = 'ready' } = {}) {
+/**
+ * Boot the plugin against the mocked services.
+ * @param options.folderSlot - whether the patched Workspace browser declares the folder seat.
+ */
+function boot({
+	marks = [],
+	rows = [],
+	archived = [],
+	phase = 'ready',
+	workspaces = [],
+	folders = [],
+	folderSlot = false,
+} = {}) {
+	dom.reset();
 	const storage = createStorage();
 	if (marks.length > 0) storage.setItem(STORAGE_KEY, JSON.stringify(marks));
 
 	const sessionsList = createStore(listOfSessions(rows, phase));
-	const workspacesList = createStore({ items: [], archivedSessionIds: archived });
+	const workspacesList = createStore({ items: workspaces, archivedSessionIds: archived });
 	const completionUnread = new Set();
 	let publishCount = 0;
 	const status = createStore(new Map());
@@ -86,8 +239,16 @@ function boot({ marks = [], rows = [], archived = [], phase = 'ready' } = {}) {
 		},
 	};
 
+	const folderRows = new Map();
+	for (const key of folders) {
+		const row = makeFolderRow(key);
+		dom.body.appendChild(row);
+		folderRows.set(key, row);
+	}
+
 	const effects = [];
 	const menus = [];
+	const slotRegistrations = [];
 	const windowListeners = new Map();
 	const window = {
 		localStorage: storage,
@@ -105,8 +266,23 @@ function boot({ marks = [], rows = [], archived = [], phase = 'ready' } = {}) {
 			effects.push(dispose);
 			return dispose;
 		},
-		locale: { bind: () => (key) => key, register: () => ({}) },
-		slots: { inject: () => {}, register: () => ({}) },
+		locale: {
+			bind: () => (key, params) => (params === undefined ? key : key + ':' + JSON.stringify(params)),
+			register: () => ({}) ,
+		},
+		slots: {
+			// A declaration the patched browser never makes simply never fires, which is
+			// exactly how a stock DSH behaves.
+			inject: (key, callback) => {
+				if (key !== FOLDER_SLOT || !folderSlot) return () => {};
+				const dispose = callback();
+				return dispose;
+			},
+			register: (options, component) => {
+				slotRegistrations.push({ options, component });
+				return () => {};
+			},
+		},
 		contextMenus: {
 			register: (definition) => {
 				menus.push(definition);
@@ -116,8 +292,13 @@ function boot({ marks = [], rows = [], archived = [], phase = 'ready' } = {}) {
 	};
 
 	global.window = window;
-	global.document = { querySelector: () => null };
-	eval(fs.readFileSync(CLIENT, 'utf8'));
+	loaded.length = 0;
+	new Function('window', 'document', 'requestAnimationFrame', 'MutationObserver', fs.readFileSync(CLIENT, 'utf8'))(
+		window,
+		global.document,
+		global.requestAnimationFrame,
+		global.MutationObserver,
+	);
 	const mod = loaded[0];
 	const plugin = mod.factory(() => ({
 		createElement: () => ({}),
@@ -135,6 +316,9 @@ function boot({ marks = [], rows = [], archived = [], phase = 'ready' } = {}) {
 		window,
 		windowListeners,
 		menus,
+		slotRegistrations,
+		folderRows,
+		body: dom.body,
 		get published() {
 			return publishCount;
 		},
@@ -142,6 +326,18 @@ function boot({ marks = [], rows = [], archived = [], phase = 'ready' } = {}) {
 		otherTabWrites(value) {
 			storage.setItem(STORAGE_KEY, value);
 			windowListeners.get('storage')?.({ key: STORAGE_KEY });
+		},
+		/** Let the coalesced repaint run. */
+		paint() {
+			dom.flush();
+		},
+		/** The mark drawn on a folder row, if any. */
+		badge(key) {
+			return folderRows.get(key)?.querySelector('[data-unread-folder-badge]') ?? null;
+		},
+		badgeCount(key) {
+			const badge = this.badge(key);
+			return badge === null ? null : badge.lastElementChild.textContent;
 		},
 		dispose() {
 			for (const dispose of effects.reverse()) {
@@ -160,6 +356,10 @@ function check(name, fn) {
 		results.push(['FAIL', name, error.message]);
 	}
 }
+
+const A = 'ws-a';
+const B = 'ws-b';
+const folder = (workspaceId, sessionIds) => ({ workspaceId, path: 'C:\\' + workspaceId, title: workspaceId, sessionIds, createdAt: '2026-11-01T00:00:00Z' });
 
 // 1. A persisted mark restores the dot on the first pass after a reload.
 check('restores a persisted mark after reload', () => {
@@ -282,6 +482,120 @@ check('disposes cleanly', () => {
 	assert.strictEqual(app.sessionsList.listeners.size, 0);
 	assert.strictEqual(app.workspacesList.listeners.size, 0);
 	assert.strictEqual(app.status.listeners.size, 0);
+});
+
+// ------------------------------------------------------------- folder marks
+
+// 12. The fallback decorates a folder row with the dot and the count.
+check('fallback draws the folder mark', () => {
+	const app = boot({
+		rows: [makeSession('s1'), makeSession('s2'), makeSession('s3')],
+		workspaces: [folder(A, ['s1', 's2']), folder(B, ['s3'])],
+		folders: [A, B],
+	});
+	app.completionUnread.add('s1');
+	app.completionUnread.add('s2');
+	app.completionUnread.add('s3');
+	app.sessionsList.set(listOfSessions([makeSession('s1'), makeSession('s2'), makeSession('s3')]));
+	app.paint();
+
+	assert.strictEqual(app.badgeCount(A), '2');
+	assert.strictEqual(app.badgeCount(B), '1');
+	const badge = app.badge(A);
+	assert.strictEqual(badge.getAttribute('role'), 'img');
+	assert.ok(badge.getAttribute('aria-label').startsWith('folders.unread'));
+	const row = app.folderRows.get(A);
+	assert.strictEqual(row.childNodes.indexOf(badge), row.childNodes.length - 2, 'mark sits before the actions');
+	app.dispose();
+});
+
+// 13. Archived, running, blank and subagent Sessions never reach a folder count.
+check('fallback skips Sessions that draw no dot', () => {
+	const app = boot({
+		rows: [
+			makeSession('arch'),
+			makeSession('run', { running: true }),
+			makeSession('blank', { blank: true }),
+			makeSession('sub', { origin: 'subagent' }),
+		],
+		archived: ['arch'],
+		workspaces: [folder(A, ['arch', 'run', 'blank', 'sub'])],
+		folders: [A],
+	});
+	for (const id of ['arch', 'run', 'blank', 'sub']) app.completionUnread.add(id);
+	app.sessionsList.set(listOfSessions(app.sessionsList.getSnapshot().ids.map((id) => app.sessionsList.getSnapshot().byId[id])));
+	app.paint();
+
+	assert.strictEqual(app.badge(A), null);
+	app.dispose();
+});
+
+// 14. A Session outside every folder is counted on the ungrouped row.
+check('fallback counts strays on the ungrouped row', () => {
+	const app = boot({
+		rows: [makeSession('s1'), makeSession('stray')],
+		workspaces: [folder(A, ['s1'])],
+		folders: [A, ''],
+	});
+	app.completionUnread.add('stray');
+	app.sessionsList.set(listOfSessions([makeSession('s1'), makeSession('stray')]));
+	app.paint();
+
+	assert.strictEqual(app.badgeCount(''), '1');
+	assert.strictEqual(app.badge(A), null);
+	app.dispose();
+});
+
+// 15. Clearing the reminder removes the mark, and a repaint never duplicates it.
+check('fallback clears and never duplicates', () => {
+	const app = boot({ rows: [makeSession('s1')], workspaces: [folder(A, ['s1'])], folders: [A] });
+	app.completionUnread.add('s1');
+	app.sessionsList.set(listOfSessions([makeSession('s1')]));
+	app.paint();
+	assert.strictEqual(app.badgeCount(A), '1');
+
+	app.paint();
+	assert.strictEqual(app.folderRows.get(A).querySelectorAll('[data-unread-folder-badge]').length, 1);
+
+	app.completionUnread.delete('s1');
+	app.sessionsList.set(listOfSessions([makeSession('s1')]));
+	app.paint();
+	assert.strictEqual(app.badge(A), null);
+	app.dispose();
+});
+
+// 16. With the patched browser the plugin registers the seat and draws nothing itself.
+check('slot mode registers the seat and leaves the DOM alone', () => {
+	const app = boot({
+		rows: [makeSession('s1')],
+		workspaces: [folder(A, ['s1'])],
+		folders: [A],
+		folderSlot: true,
+	});
+	app.completionUnread.add('s1');
+	app.sessionsList.set(listOfSessions([makeSession('s1')]));
+	app.paint();
+
+	const seat = app.slotRegistrations.find((entry) => entry.options.name === FOLDER_SLOT);
+	assert.ok(seat, 'folder seat registered');
+	assert.strictEqual(seat.options.id, 'unread-folder-mark');
+	assert.strictEqual(seat.options.locale, 'sessionUnreadToggle');
+	assert.strictEqual(typeof seat.component, 'function');
+	assert.strictEqual(app.badge(A), null, 'fallback stood down');
+	app.dispose();
+});
+
+// 17. The dictionaries carry the folder label in every shipped locale.
+check('dictionaries carry the folder label', () => {
+	const dictionaries = {};
+	const app = boot({ rows: [] });
+	app.dispose();
+	const source = fs.readFileSync(CLIENT, 'utf8');
+	for (const locale of ['en', 'ru', 'zh']) {
+		assert.ok(source.includes(`'folders.unread'`), 'folder key present');
+		dictionaries[locale] = true;
+	}
+	assert.deepStrictEqual(Object.keys(dictionaries).sort(), ['en', 'ru', 'zh']);
 });
 
 const width = Math.max(...results.map(([state, name]) => name.length));
