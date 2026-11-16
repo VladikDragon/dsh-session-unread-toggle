@@ -27,31 +27,57 @@ window.__ModuleLoader__.load({
 				'mark.unread': 'Mark as unread',
 				'mark.read': 'Mark as read',
 				'folders.unread': 'Unread sessions: {n}',
+				'folders.waiting': 'Sessions waiting for an answer: {n}',
 			},
 			ru: {
 				'mark.unread': 'Отметить как непрочитанное',
 				'mark.read': 'Отметить как прочитанное',
 				'folders.unread': 'Непрочитанных сессий: {n}',
+				'folders.waiting': 'Ожидают ответа: {n}',
 			},
 			zh: {
 				'mark.unread': '标记为未读',
 				'mark.read': '标记为已读',
 				'folders.unread': '未读会话：{n}',
+				'folders.waiting': '等待回答的会话：{n}',
 			},
 		};
 
-		/** Folder marks borrow the row's geometry: a completion-sized dot and a count. */
+		/** The two things a folder row reports, in the order it draws them. */
+		const FOLDER_KINDS = ['waiting', 'unread'];
+
+		/** Folder colors: the sidebar's own warning and completion tokens. */
+		const FOLDER_DOT_COLOR = {
+			waiting: 'var(--dsw-alias-state-warn-primary, #d99a2b)',
+			unread: 'var(--dsw-alias-state-success-primary, currentColor)',
+		};
+
+		/** A folder with nothing to report. */
+		const NO_MARKS = { waiting: 0, unread: 0 };
+
+		/**
+		 * Folder marks borrow the row's geometry: one dot-and-count pair per kind,
+		 * the waiting pair first because an unanswered Session outranks a finished one.
+		 */
 		const STYLE = [
 			BADGE_SELECTOR + ' {',
 			'  display: inline-flex;',
 			'  align-items: center;',
-			'  gap: 4px;',
+			'  gap: 6px;',
 			'  flex: none;',
 			'  margin-left: 4px;',
 			'  margin-right: 2px;',
 			'  pointer-events: none;',
 			'}',
-			BADGE_SELECTOR + ' > i {',
+			BADGE_SELECTOR + ' > span {',
+			'  display: inline-flex;',
+			'  align-items: center;',
+			'  gap: 3px;',
+			'}',
+			BADGE_SELECTOR + ' > span[hidden] {',
+			'  display: none;',
+			'}',
+			BADGE_SELECTOR + ' i {',
 			'  display: block;',
 			'  width: 8px;',
 			'  height: 8px;',
@@ -59,7 +85,10 @@ window.__ModuleLoader__.load({
 			'  flex: none;',
 			'  background: var(--dsw-alias-state-success-primary, currentColor);',
 			'}',
-			BADGE_SELECTOR + ' > b {',
+			BADGE_SELECTOR + ' span[data-kind="waiting"] i {',
+			'  background: var(--dsw-alias-state-warn-primary, #d99a2b);',
+			'}',
+			BADGE_SELECTOR + ' b {',
 			'  font-size: 11px;',
 			'  line-height: 16px;',
 			'  font-weight: 500;',
@@ -302,49 +331,143 @@ window.__ModuleLoader__.load({
 				};
 
 				/**
-				 * Unread Sessions per folder, counted from the very reminder set the
-				 * sidebar draws dots from, so a folder never promises a dot that is
-				 * absent inside it.
-				 * @returns map of workspace id ('' for ungrouped) to unread count.
+				 * Count what each folder row must report, from the very status store the
+				 * sidebar draws its own dots from, so a folder never promises a dot that
+				 * is absent inside it.
+				 *
+				 * Waiting counts the Sessions whose pending interaction is unanswered;
+				 * unread counts the finished ones the completion reminders still hold.
+				 * Each has its own number, and a Session can be in only one of them: a
+				 * Session that waits has not finished.
+				 * @returns map of workspace id ('' for ungrouped) to its counts.
 				 */
-				const countUnread = () => {
-					const counts = new Map();
-					const unread = sessionService()?.completionUnread;
-					if (!(unread instanceof Set) || unread.size === 0) return counts;
+				const collectFolderMarks = () => {
+					const marks = new Map();
 					const list = listOf();
+					const rows = list.byId ?? {};
 					const snapshot = workspaces.list.getSnapshot();
 					const archived = new Set(snapshot.archivedSessionIds ?? []);
-					const rows = list.byId ?? {};
+					const unread = sessionService()?.completionUnread;
+					const statuses = sessionService()?.sessionStatus?.getSnapshot?.();
+					const statusOf = (sessionId) => (statuses instanceof Map ? statuses.get(sessionId) : undefined);
 
-					/** Archived, running, blank and subagent Sessions draw no completion dot. */
-					const countable = (sessionId) => {
+					/** Archived, blank and subagent Sessions have no row of their own. */
+					const listed = (sessionId) => {
 						if (archived.has(sessionId)) return false;
 						const row = rows[sessionId];
-						if (row === undefined) return false;
-						if (row.running === true) return false;
-						if (row.blank === true) return false;
-						if (row.origin === 'subagent') return false;
-						return true;
+						return row !== undefined && row.blank !== true && row.origin !== 'subagent';
 					};
+					/**
+					 * The interaction kinds the Session row draws a warning dot for. Any
+					 * other kind draws nothing there, so it must not light a folder either.
+					 */
+					const visiblePending = (status) => {
+						const kind = status?.pendingInteraction?.kind;
+						return kind === 'approval' || kind === 'plan-review' || kind === 'question';
+					};
+					/** A Session waits while such an interaction is still unanswered. */
+					const waits = (sessionId) => visiblePending(statusOf(sessionId));
 
+					const membership = new Map();
 					const accounted = new Set();
-					for (const workspace of snapshot.items ?? []) {
-						let count = 0;
-						for (const sessionId of workspace.sessionIds ?? []) {
+					for (const item of snapshot.items ?? []) {
+						const ids = [];
+						for (const sessionId of item.sessionIds ?? []) {
 							accounted.add(sessionId);
-							if (unread.has(sessionId) && countable(sessionId)) count += 1;
+							if (listed(sessionId)) ids.push(sessionId);
 						}
-						if (count > 0) counts.set(workspace.workspaceId, count);
+						membership.set(item.workspaceId, ids);
+					}
+					// Sessions outside every folder land on the ungrouped row.
+					membership.set(
+						'',
+						(list.ids ?? []).filter((id) => !accounted.has(id) && listed(id)),
+					);
+
+					const workspaceOf = new Map();
+					for (const [workspaceId, ids] of membership) {
+						for (const id of ids) workspaceOf.set(id, workspaceId);
 					}
 
-					let stray = 0;
-					for (const sessionId of list.ids ?? []) {
-						if (accounted.has(sessionId)) continue;
-						if (unread.has(sessionId) && countable(sessionId)) stray += 1;
+					/**
+					 * Waiting Sessions per folder, keyed by the row that carries the dot:
+					 * a subagent's approval is counted once, on the Session above it.
+					 */
+					const waiting = new Map();
+					const addWaiting = (workspaceId, rowId) => {
+						let ids = waiting.get(workspaceId);
+						if (ids === undefined) {
+							ids = new Set();
+							waiting.set(workspaceId, ids);
+						}
+						ids.add(rowId);
+					};
+					for (const [workspaceId, ids] of membership) {
+						for (const id of ids) if (waits(id)) addWaiting(workspaceId, id);
 					}
-					if (stray > 0) counts.set('', stray);
-					return counts;
+					for (const [sessionId, status] of statuses instanceof Map ? statuses : []) {
+						if (!visiblePending(status)) continue;
+						if (workspaceOf.has(sessionId) || archived.has(sessionId)) continue;
+						let cursor = rows[sessionId];
+						for (let depth = 0; cursor !== undefined && depth < 12; depth += 1) {
+							const parentId = cursor.parentId;
+							if (parentId === undefined) break;
+							if (workspaceOf.has(parentId)) {
+								addWaiting(workspaceOf.get(parentId), parentId);
+								break;
+							}
+							cursor = rows[parentId];
+						}
+					}
+
+					for (const [workspaceId, ids] of membership) {
+						let finished = 0;
+						for (const id of ids) {
+							// The row shows one primary dot: waiting and running both outrank completion.
+							if (rows[id].running === true || waits(id)) continue;
+							if (unread instanceof Set && unread.has(id)) finished += 1;
+						}
+						const awaiting = waiting.get(workspaceId)?.size ?? 0;
+						if (finished > 0 || awaiting > 0) marks.set(workspaceId, { waiting: awaiting, unread: finished });
+					}
+					return marks;
 				};
+
+				/**
+				 * One dot-and-count pair for the React seat.
+				 * @param kind - 'waiting' or 'unread'.
+				 * @param count - how many Sessions it stands for.
+				 * @param label - the localized description.
+				 * @returns the segment element.
+				 */
+				const folderSegment = (kind, count, label) =>
+					React.createElement(
+						'span',
+						{ 'data-kind': kind, title: label },
+						React.createElement('i', {
+							style: {
+								display: 'block',
+								width: 8,
+								height: 8,
+								borderRadius: '50%',
+								flex: 'none',
+								background: FOLDER_DOT_COLOR[kind],
+							},
+						}),
+						React.createElement(
+							'b',
+							{
+								style: {
+									fontSize: 11,
+									lineHeight: '16px',
+									fontWeight: 500,
+									fontVariantNumeric: 'tabular-nums',
+									color: 'var(--dsw-alias-label-secondary, currentColor)',
+								},
+							},
+							String(count),
+						),
+					);
 
 				/**
 				 * Folder seat for the patched Workspace browser. It re-reads the counts
@@ -364,16 +487,21 @@ window.__ModuleLoader__.load({
 							for (const dispose of disposers) dispose();
 						};
 					}, []);
-					const count = countUnread().get(workspaceId ?? '') ?? 0;
-					if (count === 0) return null;
-					const label = translate('folders.unread', { n: count });
+					const counts = collectFolderMarks().get(workspaceId ?? '') ?? NO_MARKS;
+					const parts = FOLDER_KINDS.filter((kind) => counts[kind] > 0).map((kind) => ({
+						kind,
+						count: counts[kind],
+						label: translate(kind === 'waiting' ? 'folders.waiting' : 'folders.unread', { n: counts[kind] }),
+					}));
+					if (parts.length === 0) return null;
+					const label = parts.map((part) => part.label).join('; ');
 					return React.createElement(
 						'span',
 						{
 							style: {
 								display: 'inline-flex',
 								alignItems: 'center',
-								gap: 4,
+								gap: 6,
 								flex: 'none',
 								marginLeft: 4,
 								marginRight: 2,
@@ -383,29 +511,7 @@ window.__ModuleLoader__.load({
 							'aria-label': label,
 							title: label,
 						},
-						React.createElement('i', {
-							style: {
-								display: 'block',
-								width: 8,
-								height: 8,
-								borderRadius: '50%',
-								flex: 'none',
-								background: 'var(--dsw-alias-state-success-primary, currentColor)',
-							},
-						}),
-						React.createElement(
-							'b',
-							{
-								style: {
-									fontSize: 11,
-									lineHeight: '16px',
-									fontWeight: 500,
-									fontVariantNumeric: 'tabular-nums',
-									color: 'var(--dsw-alias-label-secondary, currentColor)',
-								},
-							},
-							String(count),
-						),
+						...parts.map((part) => folderSegment(part.kind, part.count, part.label)),
 					);
 				}
 
@@ -507,14 +613,29 @@ window.__ModuleLoader__.load({
 				};
 
 				/**
-				 * Draw one folder's mark, creating it on first need. The mark sits before
-				 * the row's hover actions so it keeps its place when those appear.
-				 * @param row - the folder row element.
-				 * @param count - unread Sessions in that folder.
+				 * Write one segment's count, hiding the pair while the folder has none.
+				 * @param segment - the dot-and-count pair.
+				 * @param count - how many Sessions it stands for.
+				 * @param label - the localized description.
 				 */
-				const paintRow = (row, count) => {
+				const paintSegment = (segment, count, label) => {
+					if (count === 0) segment.setAttribute('hidden', '');
+					else segment.removeAttribute('hidden');
+					const number = segment.lastElementChild;
+					const text = String(count);
+					if (number !== null && number.textContent !== text) number.textContent = text;
+					if (segment.getAttribute('title') !== label) segment.setAttribute('title', label);
+				};
+
+				/**
+				 * Draw one folder's marks, creating them on first need. The mark sits
+				 * before the row's hover actions so it keeps its place when those appear.
+				 * @param row - the folder row element.
+				 * @param counts - that folder's waiting and unread counts.
+				 */
+				const paintRow = (row, counts) => {
 					const existing = row.querySelector(BADGE_SELECTOR);
-					if (count === 0) {
+					if (counts.waiting + counts.unread === 0) {
 						if (existing !== null) existing.remove();
 						return;
 					}
@@ -523,16 +644,25 @@ window.__ModuleLoader__.load({
 						badge = document.createElement('span');
 						badge.setAttribute(BADGE_ATTRIBUTE, '');
 						badge.setAttribute('role', 'img');
-						badge.appendChild(document.createElement('i'));
-						badge.appendChild(document.createElement('b'));
+						for (const kind of FOLDER_KINDS) {
+							const segment = document.createElement('span');
+							segment.setAttribute('data-kind', kind);
+							segment.appendChild(document.createElement('i'));
+							segment.appendChild(document.createElement('b'));
+							badge.appendChild(segment);
+						}
 						const actions = row.querySelector('[class*="rowActions"]');
 						if (actions !== null && actions.parentNode === row) row.insertBefore(badge, actions);
 						else row.appendChild(badge);
 					}
-					const number = badge.lastElementChild;
-					const text = String(count);
-					if (number !== null && number.textContent !== text) number.textContent = text;
-					const description = t('folders.unread', { n: count });
+					const labels = [];
+					for (const kind of FOLDER_KINDS) {
+						const count = counts[kind];
+						const label = t(kind === 'waiting' ? 'folders.waiting' : 'folders.unread', { n: count });
+						paintSegment(badge.querySelector('[data-kind="' + kind + '"]'), count, label);
+						if (count > 0) labels.push(label);
+					}
+					const description = labels.join('; ');
 					if (badge.getAttribute('aria-label') !== description) {
 						badge.setAttribute('aria-label', description);
 						badge.setAttribute('title', description);
@@ -542,10 +672,10 @@ window.__ModuleLoader__.load({
 				/** Reconcile every folder row on screen with the current counts. */
 				const paint = () => {
 					if (slotActive || document.body === null) return;
-					const counts = countUnread();
+					const counts = collectFolderMarks();
 					for (const row of document.querySelectorAll(ROW_SELECTOR)) {
 						const raw = row.getAttribute(ROW_ATTRIBUTE) ?? '';
-						paintRow(row, counts.get(raw.slice(ROW_PREFIX.length)) ?? 0);
+						paintRow(row, counts.get(raw.slice(ROW_PREFIX.length)) ?? NO_MARKS);
 					}
 				};
 

@@ -1,8 +1,8 @@
 {
   "name": "dsh-session-unread-toggle",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "type": "module",
-  "description": "Adds a Session context-menu action that marks a finished Session as unread again (restoring the sidebar's green completion dot), and shows that dot plus an unread count on the folder that holds it.",
+  "description": "Adds a Session context-menu action that marks a finished Session as unread again (restoring the sidebar's green completion dot), and shows both an unread and a waiting count on the folder that holds those Sessions.",
   "main": "index.js",
   "exports": {
     ".": "./index.js",

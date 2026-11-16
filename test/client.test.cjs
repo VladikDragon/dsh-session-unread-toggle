@@ -86,7 +86,12 @@ function matchSelector(element, selector) {
 		return element.class.includes(needle);
 	}
 	if (selector.startsWith('[') && selector.endsWith(']')) {
-		return element.getAttribute(selector.slice(1, -1)) !== null;
+		const body = selector.slice(1, -1);
+		const equals = body.indexOf('=');
+		if (equals < 0) return element.getAttribute(body) !== null;
+		const name = body.slice(0, equals);
+		const value = body.slice(equals + 1).replace(/^"|"$/g, '');
+		return element.getAttribute(name) === value;
 	}
 	throw new Error('unsupported selector: ' + selector);
 }
@@ -219,6 +224,7 @@ function boot({
 	const sessionsList = createStore(listOfSessions(rows, phase));
 	const workspacesList = createStore({ items: workspaces, archivedSessionIds: archived });
 	const completionUnread = new Set();
+	const pending = new Map();
 	let publishCount = 0;
 	const status = createStore(new Map());
 
@@ -231,7 +237,7 @@ function boot({
 			for (const id of sessionsList.getSnapshot().ids) {
 				next.set(id, {
 					running: sessionsList.getSnapshot().byId[id].running,
-					pendingInteraction: undefined,
+					pendingInteraction: pending.get(id),
 					completionUnread: completionUnread.has(id),
 				});
 			}
@@ -312,6 +318,7 @@ function boot({
 		sessionsList,
 		workspacesList,
 		completionUnread,
+		pending,
 		status,
 		window,
 		windowListeners,
@@ -321,6 +328,12 @@ function boot({
 		body: dom.body,
 		get published() {
 			return publishCount;
+		},
+		/** Raise or clear the pending interaction of one Session, as the service would. */
+		setPending(sessionId, interaction = { kind: 'approval' }) {
+			if (interaction === null) pending.delete(sessionId);
+			else pending.set(sessionId, interaction);
+			uiSession.publishStatus();
 		},
 		/** Simulate another tab writing marks. */
 		otherTabWrites(value) {
@@ -335,9 +348,13 @@ function boot({
 		badge(key) {
 			return folderRows.get(key)?.querySelector('[data-unread-folder-badge]') ?? null;
 		},
-		badgeCount(key) {
+		/** The count one segment of a folder mark shows, or null while it is hidden. */
+		badgeCount(key, kind = 'unread') {
 			const badge = this.badge(key);
-			return badge === null ? null : badge.lastElementChild.textContent;
+			if (badge === null) return null;
+			const segment = badge.querySelector('[data-kind="' + kind + '"]');
+			if (segment === null || segment.getAttribute('hidden') !== null) return null;
+			return segment.lastElementChild.textContent;
 		},
 		dispose() {
 			for (const dispose of effects.reverse()) {
@@ -585,17 +602,157 @@ check('slot mode registers the seat and leaves the DOM alone', () => {
 	app.dispose();
 });
 
-// 17. The dictionaries carry the folder label in every shipped locale.
-check('dictionaries carry the folder label', () => {
-	const dictionaries = {};
-	const app = boot({ rows: [] });
-	app.dispose();
+// 17. The dictionaries carry both folder labels in every shipped locale.
+check('dictionaries carry the folder labels', () => {
 	const source = fs.readFileSync(CLIENT, 'utf8');
-	for (const locale of ['en', 'ru', 'zh']) {
-		assert.ok(source.includes(`'folders.unread'`), 'folder key present');
-		dictionaries[locale] = true;
+	for (const key of ["'folders.unread'", "'folders.waiting'"]) {
+		assert.ok(source.includes(key), 'missing ' + key);
 	}
-	assert.deepStrictEqual(Object.keys(dictionaries).sort(), ['en', 'ru', 'zh']);
+	const locales = source.match(/\b(en|ru|zh):\s*\{/g) ?? [];
+	assert.strictEqual(locales.length, 3, 'three locales');
+});
+
+// 18. A folder whose Sessions wait for an answer shows the yellow dot and its count.
+check('fallback draws the waiting mark', () => {
+	const app = boot({
+		rows: [makeSession('s1'), makeSession('s2'), makeSession('s3')],
+		workspaces: [folder(A, ['s1', 's2']), folder(B, ['s3'])],
+		folders: [A, B],
+	});
+	app.setPending('s1');
+	app.setPending('s2');
+	app.paint();
+
+	assert.strictEqual(app.badgeCount(A, 'waiting'), '2');
+	assert.strictEqual(app.badgeCount(A, 'unread'), null, 'no green segment while nothing finished');
+	assert.strictEqual(app.badge(B), null);
+	const badge = app.badge(A);
+	assert.strictEqual(badge.querySelectorAll('[data-kind]').length, 2, 'both segments exist');
+	assert.ok(badge.getAttribute('aria-label').startsWith('folders.waiting'));
+	app.dispose();
+});
+
+// 19. Waiting and unread are counted apart, each with its own number.
+check('fallback counts waiting and unread separately', () => {
+	const app = boot({
+		rows: [makeSession('wait1'), makeSession('wait2'), makeSession('done1')],
+		workspaces: [folder(A, ['wait1', 'wait2', 'done1'])],
+		folders: [A],
+	});
+	app.completionUnread.add('done1');
+	app.setPending('wait1');
+	app.setPending('wait2');
+	app.paint();
+
+	assert.strictEqual(app.badgeCount(A, 'waiting'), '2');
+	assert.strictEqual(app.badgeCount(A, 'unread'), '1');
+	const label = app.badge(A).getAttribute('aria-label');
+	assert.ok(label.includes('folders.waiting'), 'waiting label present');
+	assert.ok(label.includes('folders.unread'), 'unread label present');
+	assert.ok(label.includes(';'), 'labels joined');
+	app.dispose();
+});
+
+// 20. An approval raised inside a subagent lands on the folder of the row above it, once.
+check('fallback rolls a subagent approval up to its parent folder', () => {
+	const app = boot({
+		rows: [
+			makeSession('parent'),
+			makeSession('child', { origin: 'subagent', parentId: 'parent' }),
+			makeSession('other'),
+		],
+		workspaces: [folder(A, ['parent']), folder(B, ['other'])],
+		folders: [A, B],
+	});
+	app.setPending('child');
+	app.paint();
+	assert.strictEqual(app.badgeCount(A, 'waiting'), '1', 'counted on the parent folder');
+	assert.strictEqual(app.badge(B), null);
+
+	app.setPending('parent');
+	app.paint();
+	assert.strictEqual(app.badgeCount(A, 'waiting'), '1', 'parent and its child count once');
+
+	app.setPending('child', null);
+	app.setPending('parent', null);
+	app.paint();
+	assert.strictEqual(app.badge(A), null);
+	app.dispose();
+});
+
+// 21. A waiting Session is counted even while it still runs, and archiving drops it.
+check('fallback counts a running wait and skips archived ones', () => {
+	const app = boot({
+		rows: [makeSession('run', { running: true }), makeSession('arch')],
+		archived: ['arch'],
+		workspaces: [folder(A, ['run', 'arch'])],
+		folders: [A],
+	});
+	app.setPending('run');
+	app.setPending('arch');
+	app.paint();
+
+	assert.strictEqual(app.badgeCount(A, 'waiting'), '1', 'running wait counts, archived does not');
+	app.dispose();
+});
+
+// 22. Answering the interaction clears only the yellow segment.
+check('fallback clears the waiting segment alone', () => {
+	const app = boot({
+		rows: [makeSession('s1'), makeSession('s2')],
+		workspaces: [folder(A, ['s1', 's2'])],
+		folders: [A],
+	});
+	app.completionUnread.add('s2');
+	app.setPending('s1');
+	app.paint();
+	assert.strictEqual(app.badgeCount(A, 'waiting'), '1');
+	assert.strictEqual(app.badgeCount(A, 'unread'), '1');
+
+	app.setPending('s1', null);
+	app.paint();
+	assert.strictEqual(app.badgeCount(A, 'waiting'), null, 'yellow segment hidden');
+	assert.strictEqual(app.badgeCount(A, 'unread'), '1', 'green segment kept');
+	assert.strictEqual(app.badge(A).querySelectorAll('[data-unread-folder-badge]').length, 0, 'no nested badge');
+	app.dispose();
+});
+
+// 23. Repainting never duplicates the badge and keeps one pair per kind.
+check('fallback keeps one badge with two segments', () => {
+	const app = boot({ rows: [makeSession('s1')], workspaces: [folder(A, ['s1'])], folders: [A] });
+	app.setPending('s1');
+	app.paint();
+	app.paint();
+	app.paint();
+	const badges = app.folderRows.get(A).querySelectorAll('[data-unread-folder-badge]');
+	assert.strictEqual(badges.length, 1);
+	assert.strictEqual(badges[0].querySelectorAll('[data-kind]').length, 2);
+	app.dispose();
+});
+
+// 24. An interaction kind the row never draws lights no folder either.
+check('fallback ignores an invisible interaction kind', () => {
+	const app = boot({ rows: [makeSession('s1')], workspaces: [folder(A, ['s1'])], folders: [A] });
+	app.setPending('s1', { kind: 'internal-housekeeping' });
+	app.paint();
+	assert.strictEqual(app.badge(A), null);
+	app.dispose();
+});
+
+// 25. A waiting Session that still carries a reminder counts once, as waiting.
+check('fallback counts a waiting Session only as waiting', () => {
+	const app = boot({
+		rows: [makeSession('s1')],
+		workspaces: [folder(A, ['s1'])],
+		folders: [A],
+	});
+	app.completionUnread.add('s1');
+	app.setPending('s1');
+	app.paint();
+
+	assert.strictEqual(app.badgeCount(A, 'waiting'), '1');
+	assert.strictEqual(app.badgeCount(A, 'unread'), null, 'the row draws one primary dot');
+	app.dispose();
 });
 
 const width = Math.max(...results.map(([state, name]) => name.length));
