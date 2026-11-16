@@ -4,3 +4,6 @@ pnpm-lock.yaml
 *.log
 .DS_Store
 Thumbs.db
+
+# Local render of the folder marks, used to check the stylesheet by eye.
+.preview/
